@@ -1,5 +1,11 @@
 # Ultralytics YOLO 🚀, GPL-3.0 license
 from copy import copy
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[4]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import numpy as np
 import torch
@@ -72,13 +78,21 @@ class DetectionTrainer(BaseTrainer):
         # TODO: self.model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc
 
     def get_model(self, cfg=None, weights=None, verbose=True):
-        model = DetectionModel(cfg, nc=self.data['nc'], verbose=verbose and RANK == -1)
+        model = DetectionModel(cfg,
+                               nc=self.data['nc'],
+                               verbose=verbose and RANK == -1,
+                               recovery=getattr(self.args, 'recovery', None),
+                               recovery_fuse=getattr(self.args, 'recovery_fuse', None),
+                               recovery_alpha=getattr(self.args, 'recovery_alpha', None),
+                               recovery_debug_shapes=getattr(self.args, 'recovery_debug_shapes', None))
+        if getattr(self.args, 'recovery_debug_shapes', False):
+            model.recovery_debug_file = Path(self.save_dir) / 'recovery_shape_debug.txt'
         if weights:
             model.load(weights)
         return model
 
     def get_validator(self):
-        self.loss_names = 'box_loss', 'cls_loss', 'dfl_loss', 'dehaze_loss'
+        self.loss_names = 'box_loss', 'cls_loss', 'dfl_loss', 'dehaze_loss', 'recovery_loss'
         return v8.detect.DetectionValidator(self.test_loader, save_dir=self.save_dir, args=copy(self.args))
 
     def criterion(self, preds, batch):
@@ -141,6 +155,8 @@ class Loss:
         self.assigner = TaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = BboxLoss(m.reg_max - 1, use_dfl=self.use_dfl).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+        self.model = model
+        self.recovery_loss_gain = float(getattr(h, 'recovery_loss_weight', 0.0) or 0.0)
 
     @staticmethod
     def ssim_loss(pred, target, window_size=3):
@@ -224,7 +240,7 @@ class Loss:
         if (isinstance(preds, tuple) and len(preds) == 2 and torch.is_tensor(preds[1]) and preds[1].ndim == 4):
             preds, dehaze_pred = preds
 
-        loss = torch.zeros(4, device=self.device)  # box, cls, dfl, dehaze
+        loss = torch.zeros(5, device=self.device)  # box, cls, dfl, dehaze, recovery
         feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1)
@@ -271,7 +287,22 @@ class Loss:
                 dehaze_pred = F.interpolate(dehaze_pred, size=clean_img.shape[-2:], mode='bilinear', align_corners=False)
             loss[3] = self.dehaze_loss(dehaze_pred, clean_img) * getattr(self.hyp, 'dehaze', 0.05)
 
-        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl, dehaze)
+        recovery_output = getattr(self.model, 'recovery_output', None)
+        if recovery_output is not None and self.recovery_loss_gain:
+            if 'clean_img' not in batch:
+                raise RuntimeError('recovery_loss_weight > 0 requires clean_img in the training batch.')
+            dehaze_img = recovery_output.get('dehaze_img')
+            if dehaze_img is not None:
+                clean_img = batch['clean_img'].to(self.device, non_blocking=True).type_as(dehaze_img)
+                if dehaze_img.shape[-2:] != clean_img.shape[-2:]:
+                    dehaze_img = F.interpolate(dehaze_img, size=clean_img.shape[-2:], mode='bilinear',
+                                               align_corners=False)
+                recovery_l1 = F.l1_loss(dehaze_img, clean_img)
+                loss[4] = recovery_l1 * self.recovery_loss_gain
+                self.model.recovery_l1_last = float(recovery_l1.detach().cpu())
+        self.model.recovery_output = None
+
+        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl, dehaze, recovery)
 
 
 def train(cfg=DEFAULT_CFG, use_python=False):
@@ -289,4 +320,8 @@ def train(cfg=DEFAULT_CFG, use_python=False):
 
 
 if __name__ == '__main__':
-    train()
+    if len(sys.argv) > 1:
+        from ultralytics.yolo.cfg import entrypoint
+        entrypoint(debug='yolo detect train ' + ' '.join(sys.argv[1:]))
+    else:
+        train()

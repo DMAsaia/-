@@ -11,7 +11,8 @@ import torch.nn as nn
 from ultralytics.nn.modules import (C1, C2, C3, C3TR, SPP, SPPF, Bottleneck, BottleneckCSP, C2f, C3Ghost, C3x, Classify,
                                     Concat, Conv, ConvTranspose, DehazeFeatureFuse, DehazeFeatureFuseSkip,
                                     DehazeFeatureFuseSkipResidual, DehazeHead, Detect, DWConv, DWConvTranspose2d,
-                                    Ensemble, Focus, GhostBottleneck, GhostConv, Segment)
+                                    Ensemble, Focus, GhostBottleneck, GhostConv, P3AFF, Segment)
+from ultralytics.nn.recovery import RecoveryBranch
 from ultralytics.yolo.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.yolo.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.yolo.utils.torch_utils import (fuse_conv_and_bn, fuse_deconv_and_bn, initialize_weights,
@@ -192,7 +193,15 @@ class BaseModel(nn.Module):
 
 class DetectionModel(BaseModel):
     # YOLOv8 detection model
-    def __init__(self, cfg='yolov8n.yaml', ch=3, nc=None, verbose=True):  # model, input channels, number of classes
+    def __init__(self,
+                 cfg='yolov8n.yaml',
+                 ch=3,
+                 nc=None,
+                 verbose=True,
+                 recovery=None,
+                 recovery_fuse=None,
+                 recovery_alpha=None,
+                 recovery_debug_shapes=None):  # model, input channels, number of classes
         super().__init__()
         self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
 
@@ -204,26 +213,119 @@ class DetectionModel(BaseModel):
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
         self.names = {i: f'{i}' for i in range(self.yaml['nc'])}  # default names dict
         self.inplace = self.yaml.get('inplace', True)
+        self.recovery_enabled = bool(self.yaml.get('recovery', False) if recovery is None else recovery)
+        self.yaml['recovery'] = self.recovery_enabled
+        self.recovery_fuse = str(self.yaml.get('recovery_fuse', 'none') if recovery_fuse is None else recovery_fuse)
+        if self.recovery_fuse not in ('none', 'p3_fixed'):
+            raise ValueError(f"Unsupported recovery_fuse={self.recovery_fuse}; expected 'none' or 'p3_fixed'.")
+        self.yaml['recovery_fuse'] = self.recovery_fuse
+        self.recovery_alpha = float(self.yaml.get('recovery_alpha', 0.1) if recovery_alpha is None else recovery_alpha)
+        self.yaml['recovery_alpha'] = self.recovery_alpha
+        self.recovery_debug_shapes = bool(self.yaml.get('recovery_debug_shapes', False)
+                                          if recovery_debug_shapes is None else recovery_debug_shapes)
+        self.yaml['recovery_debug_shapes'] = self.recovery_debug_shapes
+        self.recovery = RecoveryBranch(ch, base_channels=32, r3_channels=64) if self.recovery_enabled else nn.Identity()
+        self.recovery_output = None
+        self.recovery_debug_count = 0
+        self.recovery_debug_file = None
 
         # Build strides
         m = self.model[-1]  # Detect()
         if isinstance(m, (Detect, Segment)):
+            p3_channels = m.cv2[0][0].conv.in_channels
+            self.recovery_p3_adapter = nn.Conv2d(64, p3_channels, 1) if self.recovery_enabled else nn.Identity()
             s = 256  # 2x min stride
             m.inplace = self.inplace
             forward = lambda x: self.forward(x)[0] if isinstance(m, Segment) else self.forward(x)
             m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])  # forward
             self.stride = m.stride
             m.bias_init()  # only run once
+            self.recovery_output = None
 
         # Init weights, biases
         initialize_weights(self)
         if verbose:
             self.info()
+            if self.recovery_enabled:
+                LOGGER.info(f'RecoveryBranch v1 enabled with '
+                            f'{sum(p.numel() for p in self.recovery.parameters())} branch parameters; '
+                            f'fuse={self.recovery_fuse}, alpha={self.recovery_alpha}')
             LOGGER.info('')
+
+    def _log_recovery_shapes(self, shapes):
+        if not self.recovery_debug_shapes or self.recovery_debug_count >= 3:
+            return
+        self.recovery_debug_count += 1
+        line = 'recovery_debug_shapes ' + ', '.join(f'{k}={v}' for k, v in shapes.items())
+        LOGGER.info(line)
+        if self.recovery_debug_file:
+            try:
+                Path(self.recovery_debug_file).parent.mkdir(parents=True, exist_ok=True)
+                with Path(self.recovery_debug_file).open('a', encoding='utf-8') as f:
+                    f.write(line + '\n')
+            except OSError as e:
+                LOGGER.warning(f'Could not write recovery debug shapes: {e}')
+
+    def _forward_once(self, x, profile=False, visualize=False):
+        y, dt, dehaze, x0 = [], [], None, x  # outputs, original input
+        for m in self.model:
+            if m.f != -1:  # if not from previous layer
+                x = x0 if m.f == -2 else y[m.f] if isinstance(m.f, int) else [
+                    x if j == -1 else x0 if j == -2 else y[j] for j in m.f]  # from earlier layers
+            if getattr(self, 'recovery_enabled', False) and isinstance(m, P3AFF):
+                recover = self.recovery_output
+                if recover is not None:
+                    if self.recovery_fuse != 'none':
+                        raise RuntimeError('P3AFF recovery fusion requires recovery_fuse=none to avoid duplicate fusion.')
+                    p3, r3 = x, recover['r3']
+                    x = [p3, r3]
+            if getattr(self, 'recovery_enabled', False) and isinstance(m, Detect):
+                recover = self.recovery_output
+                if recover is not None:
+                    p3, p4, p5 = x
+                    r3 = recover['r3']
+                    dehaze_img = recover['dehaze_img']
+                    shapes = {
+                        'input': tuple(getattr(self, 'recovery_input_shape', ())),
+                        'P3': tuple(p3.shape),
+                        'P4': tuple(p4.shape),
+                        'P5': tuple(p5.shape),
+                        'dehaze_img': tuple(dehaze_img.shape),
+                        'R3': tuple(r3.shape),
+                    }
+                    if dehaze_img.shape[-2:] != tuple(getattr(self, 'recovery_input_shape', dehaze_img.shape)[-2:]):
+                        raise RuntimeError(f'dehaze_img spatial shape mismatch: dehaze={dehaze_img.shape}, '
+                                           f'input={getattr(self, "recovery_input_shape", None)}')
+                    if r3.shape[-2:] != p3.shape[-2:]:
+                        raise RuntimeError(f'R3/P3 spatial shape mismatch: R3={r3.shape}, P3={p3.shape}')
+                    if self.recovery_fuse == 'p3_fixed':
+                        f3 = p3 + self.recovery_alpha * self.recovery_p3_adapter(r3)
+                        if f3.shape != p3.shape:
+                            raise RuntimeError(f'F3/P3 shape mismatch: F3={f3.shape}, P3={p3.shape}')
+                        x = [f3, p4, p5]
+                        shapes['F3'] = tuple(f3.shape)
+                    self._log_recovery_shapes(shapes)
+            if profile:
+                self._profile_one_layer(m, x, dt)
+            x = m(x)  # run
+            if getattr(self, 'recovery_enabled', False) and isinstance(m, P3AFF) and getattr(m, 'last_debug', None):
+                self._log_recovery_shapes({f'P3AFF_{k}': v for k, v in m.last_debug.items()})
+            if (isinstance(x, tuple) and len(x) == 2 and torch.is_tensor(x[1]) and x[1].ndim == 4):
+                x, dehaze = x
+            elif isinstance(m, DehazeHead):
+                dehaze = x
+            y.append(x if m.i in self.save else None)  # save output
+            if visualize:
+                LOGGER.info('visualize feature not yet supported')
+        return (x, dehaze) if self.training and dehaze is not None and getattr(self, 'return_dehaze', False) else x
 
     def forward(self, x, augment=False, profile=False, visualize=False):
         if augment:
             return self._forward_augment(x)  # augmented inference, None
+        self.recovery_output = None
+        self.recovery_input_shape = tuple(x.shape)
+        if getattr(self, 'recovery_enabled', False):
+            self.recovery_output = self.recovery(x)
         return self._forward_once(x, profile, visualize)  # single-scale inference, train
 
     def _forward_augment(self, x):
@@ -487,6 +589,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m is DehazeFeatureFuseSkipResidual:
             c1, c2 = ch[f[0]], ch[f[0]]
             args = [ch[f[0]], ch[f[1]], ch[f[2]], ch_in, *args]
+        elif m is P3AFF:
+            c1, c2 = ch[f], ch[f]
+            args = [c1, *args]
         elif m in (Classify, Conv, ConvTranspose, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, Focus,
                  BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x):
             c1, c2 = ch[f], args[0]

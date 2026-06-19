@@ -43,7 +43,7 @@ htmlcov/
 .nox/
 .coverage
 .coverage.*
-.cache
+.cache/
 nosetests.xml
 coverage.xml
 *.cover
@@ -57,7 +57,6 @@ coverage.xml
 
 # Django stuff:
 *.log
-!runs/**/*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -133,7 +132,17 @@ dmypy.json
 .pyre/
 
 # datasets and projects
-datasets/
+datasets/**
+!datasets/
+!datasets/VOC_hazy/
+!datasets/VOC_hazy/VOC_hazy.yaml
+!datasets/VOC_hazy_5beta/
+!datasets/VOC_hazy_5beta/*.yaml
+!datasets/VOC_hazy_5beta/train_*subset*.txt
+datasets/VOC_hazy_5beta/images/
+datasets/VOC_hazy_5beta/labels/
+datasets/VOC_hazy_5beta/clean/
+runs/
 wandb/
 
 # PyCharm user workspace state
@@ -143,10 +152,9 @@ wandb/
 
 # Neural Network weights -----------------------------------------------------------------------------------------------
 weights/
-!runs/**/weights/
 *.weights
 *.pt
-!runs/**/*.pt
+*.pth
 *.pb
 *.onnx
 *.engine

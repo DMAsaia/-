@@ -520,6 +520,42 @@ class DehazeFeatureFuseSkipResidual(nn.Module):
         residual = self.residual(torch.cat((d0, self.img_context(hazy)), 1))
         return fused, (hazy + self.residual_scale * residual).clamp(0, 1)
 
+
+class P3AFF(nn.Module):
+    """P3 Adaptive Feature Fusion with fixed-gate R3 injection."""
+
+    def __init__(self, c1=None, mode="fixed", alpha=0.0, *args, **kwargs):
+        super().__init__()
+        self.c1 = c1
+        self.mode = mode
+        self.alpha = float(alpha)
+        self.last_debug = None
+
+    def forward(self, x):
+        if not isinstance(x, (list, tuple)):
+            self.last_debug = None
+            return x
+
+        p3, r3 = x
+        if r3.shape[-2:] != p3.shape[-2:]:
+            r3 = F.interpolate(r3, size=p3.shape[-2:], mode="bilinear", align_corners=False)
+
+        if r3.shape[1] != p3.shape[1]:
+            raise RuntimeError(f"P3AFF channel mismatch: p3={p3.shape}, r3={r3.shape}")
+
+        if self.mode == "fixed":
+            f3 = p3 + self.alpha * r3
+            self.last_debug = {
+                "mode": self.mode,
+                "alpha": self.alpha,
+                "P3": tuple(p3.shape),
+                "R3": tuple(r3.shape),
+                "F3": tuple(f3.shape),
+            }
+            return f3
+
+        raise NotImplementedError(f"Unsupported P3AFF mode: {self.mode}")
+
 ######################"""
 
 

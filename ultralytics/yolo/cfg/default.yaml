@@ -95,6 +95,11 @@ dehaze_residual_scale: 0.25  # residual RGB output scale for skip dehazing decod
 dehaze_ssim: 0.1  # SSIM loss weight inside the auxiliary dehazing loss
 dehaze_grad: 0.05  # image-gradient loss weight inside the auxiliary dehazing loss
 dehaze_color: 0.02  # RGB channel-mean color loss weight inside the auxiliary dehazing loss
+recovery: False  # enable RecoveryBranch v1 auxiliary dehazing branch
+recovery_fuse: none  # RecoveryBranch fusion mode: none or p3_fixed
+recovery_alpha: 0.1  # scale for p3_fixed residual feature injection
+recovery_loss_weight: 0.0  # L1 gain between recovery dehaze output and clean target
+recovery_debug_shapes: False  # print and save first few RecoveryBranch tensor shapes
 fl_gamma: 0.0  # focal loss gamma (efficientDet default gamma=1.5)
 label_smoothing: 0.0  # label smoothing (fraction)
 nbs: 64  # nominal batch size
