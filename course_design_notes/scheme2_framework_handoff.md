@@ -43,7 +43,7 @@ dehaze=0.05
 | 项目 | 内容 |
 |---|---|
 | 操作系统 | Windows |
-| 项目路径 | `C:/Python/project/ultralytics-yolov8-official` |
+| 项目路径 | 仓库根目录 |
 | Ultralytics | YOLOv8.0.61 |
 | Python | 3.10.20 |
 | PyTorch | 2.6.0+cu124 |
@@ -255,7 +255,7 @@ yolo detect train model=ultralytics/models/v8/yolov8-dehaze.yaml pretrained=yolo
 | 组别 | 结果目录 | 设置 | Precision | Recall | mAP50 | mAP50-95 | train/dehaze_loss |
 |---|---|---|---:|---:|---:|---:|---:|
 | A | `runs/detect/baseline_yolov8n_local_50e` | YOLOv8n baseline | 0.6896 | 0.6024 | 0.6519 | 0.4382 | 0 |
-| B | `C:/Users/卢治廷/Desktop/大三下课程/模式识别课设/YOLO v8 dehaze=0 50轮初跑/train11` | YOLOv8-dehaze, `dehaze=0` | 0.6866 | 0.6115 | 0.6588 | 0.4475 | 0 |
+| B | `runs/detect/train11` | YOLOv8-dehaze, `dehaze=0` | 0.6866 | 0.6115 | 0.6588 | 0.4475 | 0 |
 | C | `runs/detect/train8` | YOLOv8-dehaze, `dehaze=0.05` | 0.7027 | 0.6141 | 0.6659 | 0.4531 | 0.00662 |
 | D | `runs/detect/train9` | YOLOv8-dehaze, `dehaze=0.10` | 0.7081 | 0.6023 | 0.6621 | 0.4490 | 0.01151 |
 

@@ -90,7 +90,7 @@ YOLOv8 中的上采样、Concat、C2f 等组成 Neck。
 你的代码路径：
 
 ```text
-C:/Python/project/ultralytics-yolov8-official
+.
 ```
 
 重点文件：
