@@ -8,8 +8,8 @@ import thop
 import torch
 import torch.nn as nn
 
-from ultralytics.nn.modules import (C1, C2, C3, C3TR, SPP, SPPF, Bottleneck, BottleneckCSP, C2f, C3Ghost, C3x, Classify,
-                                    Concat, Conv, ConvTranspose, DehazeFeatureFuse, DehazeFeatureFuseSkip,
+from ultralytics.nn.modules import (AFFMRecon, C1, C2, C3, C3TR, SPP, SPPF, Bottleneck, BottleneckCSP, C2f, C3Ghost,
+                                    C3x, Classify, Concat, Conv, ConvTranspose, DehazeFeatureFuse, DehazeFeatureFuseSkip,
                                     DehazeFeatureFuseSkipResidual, DehazeHead, Detect, DWConv, DWConvTranspose2d,
                                     Ensemble, Focus, GhostBottleneck, GhostConv, P3AFF, Segment)
 from ultralytics.nn.recovery import RecoveryBranch
@@ -51,7 +51,7 @@ class BaseModel(nn.Module):
         Returns:
             (torch.Tensor): The last output of the model.
         """
-        y, dt, dehaze, x0 = [], [], None, x  # outputs, original input
+        y, dt, dehaze, x0 = [], [], None, x  # outputs, auxiliary output, original input
         for m in self.model:
             if m.f != -1:  # if not from previous layer
                 x = x0 if m.f == -2 else y[m.f] if isinstance(m.f, int) else [
@@ -59,7 +59,9 @@ class BaseModel(nn.Module):
             if profile:
                 self._profile_one_layer(m, x, dt)
             x = m(x)  # run
-            if (isinstance(x, tuple) and len(x) == 2 and torch.is_tensor(x[1]) and x[1].ndim == 4):
+            if isinstance(x, tuple) and len(x) == 2 and isinstance(x[1], dict):
+                x, dehaze = x
+            elif (isinstance(x, tuple) and len(x) == 2 and torch.is_tensor(x[1]) and x[1].ndim == 4):
                 x, dehaze = x
             elif isinstance(m, DehazeHead):
                 dehaze = x
@@ -201,6 +203,7 @@ class DetectionModel(BaseModel):
                  recovery=None,
                  recovery_fuse=None,
                  recovery_alpha=None,
+                 affm_alpha_max=None,
                  recovery_debug_shapes=None):  # model, input channels, number of classes
         super().__init__()
         self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
@@ -216,16 +219,22 @@ class DetectionModel(BaseModel):
         self.recovery_enabled = bool(self.yaml.get('recovery', False) if recovery is None else recovery)
         self.yaml['recovery'] = self.recovery_enabled
         self.recovery_fuse = str(self.yaml.get('recovery_fuse', 'none') if recovery_fuse is None else recovery_fuse)
-        if self.recovery_fuse not in ('none', 'p3_fixed'):
-            raise ValueError(f"Unsupported recovery_fuse={self.recovery_fuse}; expected 'none' or 'p3_fixed'.")
+        if self.recovery_fuse not in ('none', 'p3_fixed', 'affm_lite'):
+            raise ValueError(f"Unsupported recovery_fuse={self.recovery_fuse}; "
+                             f"expected 'none', 'p3_fixed' or 'affm_lite'.")
         self.yaml['recovery_fuse'] = self.recovery_fuse
         self.recovery_alpha = float(self.yaml.get('recovery_alpha', 0.1) if recovery_alpha is None else recovery_alpha)
         self.yaml['recovery_alpha'] = self.recovery_alpha
+        self.affm_alpha_max = float(self.yaml.get('affm_alpha_max', 0.2)
+                                    if affm_alpha_max is None else affm_alpha_max)
+        self.yaml['affm_alpha_max'] = self.affm_alpha_max
         self.recovery_debug_shapes = bool(self.yaml.get('recovery_debug_shapes', False)
                                           if recovery_debug_shapes is None else recovery_debug_shapes)
         self.yaml['recovery_debug_shapes'] = self.recovery_debug_shapes
         self.recovery = RecoveryBranch(ch, base_channels=32, r3_channels=64) if self.recovery_enabled else nn.Identity()
+        self.recovery_affm_gate = nn.Identity()
         self.recovery_output = None
+        self.recovery_last_debug = {}
         self.recovery_debug_count = 0
         self.recovery_debug_file = None
 
@@ -234,6 +243,10 @@ class DetectionModel(BaseModel):
         if isinstance(m, (Detect, Segment)):
             p3_channels = m.cv2[0][0].conv.in_channels
             self.recovery_p3_adapter = nn.Conv2d(64, p3_channels, 1) if self.recovery_enabled else nn.Identity()
+            if self.recovery_enabled and self.recovery_fuse == 'affm_lite':
+                self.recovery_affm_gate = nn.Conv2d(p3_channels * 2, 1, 3, padding=1)
+                nn.init.zeros_(self.recovery_affm_gate.weight)
+                nn.init.zeros_(self.recovery_affm_gate.bias)
             s = 256  # 2x min stride
             m.inplace = self.inplace
             forward = lambda x: self.forward(x)[0] if isinstance(m, Segment) else self.forward(x)
@@ -249,7 +262,8 @@ class DetectionModel(BaseModel):
             if self.recovery_enabled:
                 LOGGER.info(f'RecoveryBranch v1 enabled with '
                             f'{sum(p.numel() for p in self.recovery.parameters())} branch parameters; '
-                            f'fuse={self.recovery_fuse}, alpha={self.recovery_alpha}')
+                            f'fuse={self.recovery_fuse}, alpha={self.recovery_alpha}, '
+                            f'affm_alpha_max={self.affm_alpha_max}')
             LOGGER.info('')
 
     def _log_recovery_shapes(self, shapes):
@@ -267,7 +281,8 @@ class DetectionModel(BaseModel):
                 LOGGER.warning(f'Could not write recovery debug shapes: {e}')
 
     def _forward_once(self, x, profile=False, visualize=False):
-        y, dt, dehaze, x0 = [], [], None, x  # outputs, original input
+        y, dt, dehaze, x0 = [], [], None, x  # outputs, auxiliary output, original input
+        self.recovery_last_debug = {}
         for m in self.model:
             if m.f != -1:  # if not from previous layer
                 x = x0 if m.f == -2 else y[m.f] if isinstance(m.f, int) else [
@@ -299,18 +314,63 @@ class DetectionModel(BaseModel):
                     if r3.shape[-2:] != p3.shape[-2:]:
                         raise RuntimeError(f'R3/P3 spatial shape mismatch: R3={r3.shape}, P3={p3.shape}')
                     if self.recovery_fuse == 'p3_fixed':
-                        f3 = p3 + self.recovery_alpha * self.recovery_p3_adapter(r3)
+                        r3_align = self.recovery_p3_adapter(r3)
+                        f3 = p3 + self.recovery_alpha * r3_align
                         if f3.shape != p3.shape:
                             raise RuntimeError(f'F3/P3 shape mismatch: F3={f3.shape}, P3={p3.shape}')
                         x = [f3, p4, p5]
+                        shapes['R3_align'] = tuple(r3_align.shape)
                         shapes['F3'] = tuple(f3.shape)
+                        self.recovery_last_debug = {
+                            'mode': self.recovery_fuse,
+                            'P3': tuple(p3.shape),
+                            'R3': tuple(r3.shape),
+                            'R3_align': tuple(r3_align.shape),
+                            'F3': tuple(f3.shape),
+                        }
+                    elif self.recovery_fuse == 'affm_lite':
+                        r3_align = self.recovery_p3_adapter(r3)
+                        gate = torch.sigmoid(self.recovery_affm_gate(torch.cat((p3, r3_align), 1)))
+                        f3 = p3 + self.affm_alpha_max * gate * r3_align
+                        if gate.shape != (p3.shape[0], 1, p3.shape[2], p3.shape[3]):
+                            raise RuntimeError(f'AFFM-lite gate shape mismatch: gate={gate.shape}, P3={p3.shape}')
+                        if f3.shape != p3.shape:
+                            raise RuntimeError(f'F3/P3 shape mismatch: F3={f3.shape}, P3={p3.shape}')
+                        x = [f3, p4, p5]
+                        gate_detached = gate.detach()
+                        effective_alpha = self.affm_alpha_max * gate_detached.mean().item()
+                        shapes.update({
+                            'R3_align': tuple(r3_align.shape),
+                            'gate': tuple(gate.shape),
+                            'F3': tuple(f3.shape),
+                            'gate_min': f'{gate_detached.min().item():.6f}',
+                            'gate_max': f'{gate_detached.max().item():.6f}',
+                            'gate_mean': f'{gate_detached.mean().item():.6f}',
+                            'gate_std': f'{gate_detached.std(unbiased=False).item():.6f}',
+                            'effective_alpha': f'{effective_alpha:.6f}',
+                        })
+                        self.recovery_last_debug = {
+                            'mode': self.recovery_fuse,
+                            'P3': tuple(p3.shape),
+                            'R3': tuple(r3.shape),
+                            'R3_align': tuple(r3_align.shape),
+                            'gate': tuple(gate.shape),
+                            'F3': tuple(f3.shape),
+                            'gate_min': gate_detached.min().item(),
+                            'gate_max': gate_detached.max().item(),
+                            'gate_mean': gate_detached.mean().item(),
+                            'gate_std': gate_detached.std(unbiased=False).item(),
+                            'effective_alpha': effective_alpha,
+                        }
                     self._log_recovery_shapes(shapes)
             if profile:
                 self._profile_one_layer(m, x, dt)
             x = m(x)  # run
             if getattr(self, 'recovery_enabled', False) and isinstance(m, P3AFF) and getattr(m, 'last_debug', None):
                 self._log_recovery_shapes({f'P3AFF_{k}': v for k, v in m.last_debug.items()})
-            if (isinstance(x, tuple) and len(x) == 2 and torch.is_tensor(x[1]) and x[1].ndim == 4):
+            if isinstance(x, tuple) and len(x) == 2 and isinstance(x[1], dict):
+                x, dehaze = x
+            elif (isinstance(x, tuple) and len(x) == 2 and torch.is_tensor(x[1]) and x[1].ndim == 4):
                 x, dehaze = x
             elif isinstance(m, DehazeHead):
                 dehaze = x
@@ -587,6 +647,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             c1, c2 = ch[f[0]], ch[f[0]]
             args = [ch[f[0]], ch[f[1]], ch[f[2]], *args]
         elif m is DehazeFeatureFuseSkipResidual:
+            c1, c2 = ch[f[0]], ch[f[0]]
+            args = [ch[f[0]], ch[f[1]], ch[f[2]], ch_in, *args]
+        elif m is AFFMRecon:
             c1, c2 = ch[f[0]], ch[f[0]]
             args = [ch[f[0]], ch[f[1]], ch[f[2]], ch_in, *args]
         elif m is P3AFF:

@@ -521,14 +521,84 @@ class DehazeFeatureFuseSkipResidual(nn.Module):
         return fused, (hazy + self.residual_scale * residual).clamp(0, 1)
 
 
+class AFFMRecon(nn.Module):
+    """Detection-oriented AFFM + RSM block with hazy-image reconstruction only."""
+
+    def __init__(self, c1, c2_skip, c1_skip, c_img=3, c_out=3, fuse=True, alpha=0.1, t_min=0.05):
+        super().__init__()
+        c_mid = max(c1 // 2, 16)
+        c_low = max(c_mid // 2, 8)
+        self.fuse = fuse
+        self.register_buffer('alpha', torch.tensor(float(alpha)))
+        self.register_buffer('t_min', torch.tensor(float(t_min)))
+
+        self.affm_feat = nn.Sequential(
+            DWConv(c1, c1, 3, 1),
+            Conv(c1, c1, 1, 1))
+        nn.init.zeros_(self.affm_feat[-1].bn.weight)
+        nn.init.zeros_(self.affm_feat[-1].bn.bias)
+        self.affm_gate = nn.Sequential(
+            nn.Conv2d(c1, c1, 1),
+            nn.Sigmoid())
+
+        self.skip_p2 = Conv(c2_skip, c_mid, 1, 1)
+        self.dec_p2 = nn.Sequential(
+            Conv(c1 + c_mid, c_mid, 3, 1),
+            Conv(c_mid, c_mid, 3, 1))
+        self.skip_p1 = Conv(c1_skip, c_low, 1, 1)
+        self.dec_p1 = nn.Sequential(
+            Conv(c_mid + c_low, c_low, 3, 1),
+            Conv(c_low, c_low, 3, 1))
+        self.img_context = Conv(c_img, c_low, 3, 1)
+        self.rsm = nn.Sequential(
+            Conv(c_low * 2, c_low, 3, 1),
+            Conv(c_low, c_low, 3, 1))
+        self.j_head = nn.Sequential(nn.Conv2d(c_low, c_out, 1), nn.Sigmoid())
+        self.t_head = nn.Conv2d(c_low, 1, 1)
+        self.a_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c_low, c_out, 1),
+            nn.Sigmoid())
+
+    def forward(self, x):
+        p3, p2, p1, hazy = x
+        affm_feat = self.affm_feat(p3)
+        fused = p3 + self.alpha * self.affm_gate(affm_feat) * affm_feat if self.fuse else p3
+
+        d2 = F.interpolate(affm_feat, size=p2.shape[-2:], mode='nearest')
+        d2 = self.dec_p2(torch.cat((d2, self.skip_p2(p2)), 1))
+        d1 = F.interpolate(d2, size=p1.shape[-2:], mode='nearest')
+        d1 = self.dec_p1(torch.cat((d1, self.skip_p1(p1)), 1))
+        d0 = F.interpolate(d1, size=hazy.shape[-2:], mode='nearest')
+        rsm_feat = self.rsm(torch.cat((d0, self.img_context(hazy)), 1))
+
+        j_hat = self.j_head(rsm_feat)
+        t = self.t_min + (1.0 - self.t_min) * torch.sigmoid(self.t_head(rsm_feat))
+        atmosphere = self.a_head(rsm_feat)
+        recon = (j_hat * t + atmosphere * (1.0 - t)).clamp(0, 1)
+        aux = {
+            'recon_img': recon,
+            'j_hat': j_hat,
+            't': t,
+            'atmosphere': atmosphere,
+        }
+        return fused, aux
+
+
 class P3AFF(nn.Module):
-    """P3 Adaptive Feature Fusion with fixed-gate R3 injection."""
+    """P3 Adaptive Feature Fusion with fixed-alpha R3 injection."""
 
     def __init__(self, c1=None, mode="fixed", alpha=0.0, *args, **kwargs):
         super().__init__()
         self.c1 = c1
         self.mode = mode
         self.alpha = float(alpha)
+        self.r3_proj = None
+        if self.mode == "fixed_proj":
+            if c1 is None:
+                raise ValueError("P3AFF fixed_proj mode requires c1.")
+            self.r3_proj = nn.Conv2d(c1, c1, 1, bias=False)
+            nn.init.zeros_(self.r3_proj.weight)
         self.last_debug = None
 
     def forward(self, x):
@@ -543,13 +613,15 @@ class P3AFF(nn.Module):
         if r3.shape[1] != p3.shape[1]:
             raise RuntimeError(f"P3AFF channel mismatch: p3={p3.shape}, r3={r3.shape}")
 
-        if self.mode == "fixed":
-            f3 = p3 + self.alpha * r3
+        if self.mode in ("fixed", "fixed_proj"):
+            r3_fuse = self.r3_proj(r3) if self.r3_proj is not None else r3
+            f3 = p3 + self.alpha * r3_fuse
             self.last_debug = {
                 "mode": self.mode,
                 "alpha": self.alpha,
                 "P3": tuple(p3.shape),
                 "R3": tuple(r3.shape),
+                "R3_fuse": tuple(r3_fuse.shape),
                 "F3": tuple(f3.shape),
             }
             return f3

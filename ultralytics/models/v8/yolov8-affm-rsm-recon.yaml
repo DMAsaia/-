@@ -1,10 +1,13 @@
 # Ultralytics YOLO, GPL-3.0 license
-# YOLOv8 P3-AFF fixed gate Step 2A, alpha=0.05.
+# YOLOv8 AFFM + RSM recon-only model. No clean target loss and no RecoveryBranch.
 
 nc: 80
-recovery: True
+recovery: False
 recovery_fuse: none
 recovery_loss_weight: 0.0
+recon_loss_weight: 0.0
+recon_foreground: False
+recon_warmup_epochs: 0.0
 scales:
   n: [0.33, 0.25, 1024]
   s: [0.33, 0.50, 1024]
@@ -41,5 +44,5 @@ head:
   - [[-1, 9], 1, Concat, [1]]
   - [-1, 3, C2f, [1024]]
 
-  - [15, 1, P3AFF, [fixed, 0.05]]
+  - [[15, 4, 2, -2], 1, AFFMRecon, [3, True, 0.1, 0.05]]
   - [[22, 18, 21], 1, Detect, [nc]]

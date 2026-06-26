@@ -1,11 +1,18 @@
 # Ultralytics YOLO 🚀, GPL-3.0 license
 from copy import copy
 from pathlib import Path
+import os
 import sys
 
 ROOT = Path(__file__).resolve().parents[4]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# Local Windows/Conda environments can load duplicate Intel OpenMP runtimes
+# through torch, numpy, opencv, pandas, or matplotlib. Keep training alive.
+os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
 
 import numpy as np
 import torch
@@ -84,6 +91,7 @@ class DetectionTrainer(BaseTrainer):
                                recovery=getattr(self.args, 'recovery', None),
                                recovery_fuse=getattr(self.args, 'recovery_fuse', None),
                                recovery_alpha=getattr(self.args, 'recovery_alpha', None),
+                               affm_alpha_max=getattr(self.args, 'affm_alpha_max', None),
                                recovery_debug_shapes=getattr(self.args, 'recovery_debug_shapes', None))
         if getattr(self.args, 'recovery_debug_shapes', False):
             model.recovery_debug_file = Path(self.save_dir) / 'recovery_shape_debug.txt'
@@ -98,6 +106,7 @@ class DetectionTrainer(BaseTrainer):
     def criterion(self, preds, batch):
         if not hasattr(self, 'compute_loss'):
             self.compute_loss = Loss(de_parallel(self.model))
+        self.model.current_epoch = getattr(self, 'epoch', 0)
         return self.compute_loss(preds, batch)
 
     def label_loss_items(self, loss_items=None, prefix='train'):
@@ -157,6 +166,11 @@ class Loss:
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
         self.model = model
         self.recovery_loss_gain = float(getattr(h, 'recovery_loss_weight', 0.0) or 0.0)
+        self.recon_loss_gain = float(getattr(h, 'recon_loss_weight', 0.0) or 0.0)
+        self.recon_warmup_epochs = float(getattr(h, 'recon_warmup_epochs', 0.0) or 0.0)
+        recon_foreground = getattr(h, 'recon_foreground', False)
+        self.recon_foreground = recon_foreground if isinstance(recon_foreground, bool) else \
+            str(recon_foreground).lower() in ('1', 'true', 'yes')
 
     @staticmethod
     def ssim_loss(pred, target, window_size=3):
@@ -211,6 +225,33 @@ class Loss:
             loss = loss + color_weight * self.color_loss(pred, target)
         return loss
 
+    @staticmethod
+    def foreground_mask(batch, shape, device):
+        b, _, h, w = shape
+        mask = torch.zeros((b, 1, h, w), device=device)
+        boxes = batch.get('bboxes')
+        batch_idx = batch.get('batch_idx')
+        if boxes is None or batch_idx is None or boxes.numel() == 0:
+            return mask
+        boxes = boxes.to(device)
+        batch_idx = batch_idx.view(-1).long().to(device)
+        for i, box in zip(batch_idx.tolist(), boxes):
+            cx, cy, bw, bh = box.tolist()
+            x1 = max(0, min(w, int((cx - bw / 2) * w)))
+            y1 = max(0, min(h, int((cy - bh / 2) * h)))
+            x2 = max(0, min(w, int((cx + bw / 2) * w)))
+            y2 = max(0, min(h, int((cy + bh / 2) * h)))
+            if x2 > x1 and y2 > y1:
+                mask[i, :, y1:y2, x1:x2] = 1.0
+        return mask
+
+    def recon_gain(self):
+        gain = self.recon_loss_gain
+        if self.recon_warmup_epochs > 0:
+            epoch = float(getattr(self.model, 'current_epoch', 0))
+            gain *= min(1.0, max(0.0, (epoch + 1.0) / self.recon_warmup_epochs))
+        return gain
+
     def preprocess(self, targets, batch_size, scale_tensor):
         if targets.shape[0] == 0:
             out = torch.zeros(batch_size, 0, 5, device=self.device)
@@ -237,8 +278,12 @@ class Loss:
 
     def __call__(self, preds, batch):
         dehaze_pred = None
-        if (isinstance(preds, tuple) and len(preds) == 2 and torch.is_tensor(preds[1]) and preds[1].ndim == 4):
-            preds, dehaze_pred = preds
+        aux_pred = None
+        if isinstance(preds, tuple) and len(preds) == 2:
+            if isinstance(preds[1], dict):
+                preds, aux_pred = preds
+            elif torch.is_tensor(preds[1]) and preds[1].ndim == 4:
+                preds, dehaze_pred = preds
 
         loss = torch.zeros(5, device=self.device)  # box, cls, dfl, dehaze, recovery
         feats = preds[1] if isinstance(preds, tuple) else preds
@@ -286,6 +331,25 @@ class Loss:
             if dehaze_pred.shape[-2:] != clean_img.shape[-2:]:
                 dehaze_pred = F.interpolate(dehaze_pred, size=clean_img.shape[-2:], mode='bilinear', align_corners=False)
             loss[3] = self.dehaze_loss(dehaze_pred, clean_img) * getattr(self.hyp, 'dehaze', 0.05)
+
+        if aux_pred is not None and self.recon_loss_gain:
+            recon_img = aux_pred.get('recon_img')
+            if recon_img is not None:
+                hazy_img = batch['img'].to(self.device, non_blocking=True).type_as(recon_img)
+                if recon_img.shape[-2:] != hazy_img.shape[-2:]:
+                    recon_img = F.interpolate(recon_img, size=hazy_img.shape[-2:], mode='bilinear',
+                                              align_corners=False)
+                recon_l1_map = (recon_img - hazy_img).abs()
+                if self.recon_foreground:
+                    mask = self.foreground_mask(batch, recon_img.shape, self.device).type_as(recon_img)
+                    if mask.sum() > 0:
+                        recon_l1 = (recon_l1_map * mask).sum() / (mask.sum() * recon_img.shape[1]).clamp_min(1.0)
+                    else:
+                        recon_l1 = recon_l1_map.mean()
+                else:
+                    recon_l1 = recon_l1_map.mean()
+                loss[3] = loss[3] + recon_l1 * self.recon_gain()
+                self.model.recon_l1_last = float(recon_l1.detach().cpu())
 
         recovery_output = getattr(self.model, 'recovery_output', None)
         if recovery_output is not None and self.recovery_loss_gain:
